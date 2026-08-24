@@ -1,0 +1,17 @@
+# 원시 측정 로그 — research/freetoken-vs-ollama.md §11.5 (MLX 경로)
+# 2026-08-24, 로컬 M3 Max (RAM 39GB, macOS 26.5), qwen3.5:4b-mlx
+
+CALIB total_tokens=19149  cold_prefill=21.62s
+CALIB ~29.9 tokens/section -> the 8192 snapshot lands near section 274 (43% depth)
+
+edit_depth  tok_pos   cold_s  edited_s   saved   expectation
+MLX rep1    12%     2297    22.75     24.43   -7.4%   full re-prefill (no snapshot before edit)
+MLX rep1    37%     7085    24.81     24.48    1.4%   full re-prefill (no snapshot before edit)
+MLX rep1    62%    11872    27.81     18.46   33.6%   restore from 8192 -> ~43% saved
+MLX rep1    87%    16659    32.09      7.12   77.8%   restore from 8192 -> ~43% saved
+MLX rep2    12%     2297    62.02    112.19  -80.9%   full re-prefill (no snapshot before edit)
+MLX rep2    37%     7085    55.74     43.74   21.5%   full re-prefill (no snapshot before edit)
+MLX rep2    62%    11872    34.20     23.63   30.9%   restore from 8192 -> ~43% saved
+MLX rep2    87%    16659    36.26      8.32   77.1%   restore from 8192 -> ~43% saved
+
+ALL_DONE_MLX
