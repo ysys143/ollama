@@ -1,0 +1,76 @@
+# 원시 측정 로그 — research/freetoken-vs-ollama.md §11
+# 2026-08-24, Brev pgcuvs-freetoken-rtx6000ada (RTX 6000 Ada 48GB), gpt-oss:120b MXFP4
+
+### exp1: ncmoe sweep
+RESULT B baseline_auto run1 prefill_tok=361 prefill_tps=268.5 decode_tok=128 decode_tps=50.01
+RESULT B baseline_auto run2 prefill_tok=361 prefill_tps=337.9 decode_tok=128 decode_tps=54.37
+VRAM_baseline_auto 47474 MiB
+RESULT B ncmoe4 PROCESS_DIED
+RESULT B ncmoe8 PROCESS_DIED
+RESULT B ncmoe12 run1 prefill_tok=361 prefill_tps=320.2 decode_tok=128 decode_tps=47.50
+RESULT B ncmoe12 run2 prefill_tok=361 prefill_tps=317.7 decode_tok=128 decode_tps=48.15
+VRAM_ncmoe12 43150 MiB
+RESULT B ncmoe16 run1 prefill_tok=361 prefill_tps=247.1 decode_tok=128 decode_tps=40.56
+RESULT B ncmoe16 run2 prefill_tok=361 prefill_tps=282.9 decode_tok=128 decode_tps=40.72
+VRAM_ncmoe16 36680 MiB
+RESULT B ncmoe24 run1 prefill_tok=361 prefill_tps=172.3 decode_tok=128 decode_tps=26.64
+RESULT B ncmoe24 run2 prefill_tok=361 prefill_tps=184.6 decode_tok=128 decode_tps=29.72
+VRAM_ncmoe24 23742 MiB
+RESULT B ncmoe36 run1 prefill_tok=361 prefill_tps=96.9 decode_tok=128 decode_tps=20.30
+RESULT B ncmoe36 run2 prefill_tok=361 prefill_tps=109.4 decode_tok=128 decode_tps=20.52
+VRAM_ncmoe36 4334 MiB
+
+### exp2c: edit depth (contamination-free)
+EXP2C edit_at_ 5pct rep1  cold=  9.56s  edited=  9.46s  ratio= 0.99  saved=  1.0%  (ideal saving ~5%)  tokens=5080
+EXP2C edit_at_25pct rep1  cold=  9.38s  edited=  9.62s  ratio= 1.03  saved= -2.6%  (ideal saving ~25%)  tokens=5080
+EXP2C edit_at_50pct rep1  cold=  9.47s  edited=  9.67s  ratio= 1.02  saved= -2.2%  (ideal saving ~50%)  tokens=5080
+EXP2C edit_at_75pct rep1  cold=  9.73s  edited= 10.72s  ratio= 1.10  saved=-10.2%  (ideal saving ~75%)  tokens=5080
+EXP2C edit_at_95pct rep1  cold= 10.62s  edited=  1.05s  ratio= 0.10  saved= 90.1%  (ideal saving ~95%)  tokens=5080
+EXP2C edit_at_99pct rep1  cold= 10.13s  edited=  0.61s  ratio= 0.06  saved= 94.0%  (ideal saving ~99%)  tokens=5080
+EXP2C edit_at_ 5pct rep2  cold= 10.37s  edited= 10.24s  ratio= 0.99  saved=  1.2%  (ideal saving ~5%)  tokens=5080
+EXP2C edit_at_25pct rep2  cold= 10.59s  edited= 10.84s  ratio= 1.02  saved= -2.4%  (ideal saving ~25%)  tokens=5080
+EXP2C edit_at_50pct rep2  cold= 10.29s  edited= 10.53s  ratio= 1.02  saved= -2.3%  (ideal saving ~50%)  tokens=5080
+EXP2C edit_at_75pct rep2  cold= 10.09s  edited= 10.21s  ratio= 1.01  saved= -1.2%  (ideal saving ~75%)  tokens=5080
+EXP2C edit_at_95pct rep2  cold= 11.77s  edited=  1.15s  ratio= 0.10  saved= 90.3%  (ideal saving ~95%)  tokens=5080
+EXP2C edit_at_99pct rep2  cold= 10.76s  edited=  0.68s  ratio= 0.06  saved= 93.7%  (ideal saving ~99%)  tokens=5080
+
+### exp3: cache-reuse
+===== 3A: direct, NO --cache-reuse =====
+EXP3 A_no_reuse     edit_at_25pct cold= 11.94s edited= 12.01s ratio= 1.01 saved= -0.6%
+EXP3 A_no_reuse     edit_at_50pct cold= 11.64s edited= 12.12s ratio= 1.04 saved= -4.2%
+EXP3 A_no_reuse     edit_at_75pct cold= 10.71s edited= 10.76s ratio= 1.00 saved= -0.5%
+EXP3 A_no_reuse     edit_at_95pct cold= 10.14s edited=  1.10s ratio= 0.11 saved= 89.2%
+===== 3B: direct, WITH --cache-reuse 256 =====
+EXP3 B_reuse256     edit_at_25pct cold= 10.17s edited= 10.35s ratio= 1.02 saved= -1.8%
+EXP3 B_reuse256     edit_at_50pct cold= 10.07s edited= 10.43s ratio= 1.04 saved= -3.6%
+EXP3 B_reuse256     edit_at_75pct cold=  9.38s edited=  9.64s ratio= 1.03 saved= -2.7%
+EXP3 B_reuse256     edit_at_95pct cold=  9.36s edited=  0.99s ratio= 0.11 saved= 89.4%
+===== 3C: ollama serve + LLAMA_ARG_CACHE_REUSE=256 env =====
+EXP3 C_ollama_env   edit_at_25pct cold=  8.93s edited= 10.33s ratio= 1.16 saved=-15.7%
+EXP3 C_ollama_env   edit_at_50pct cold=  9.05s edited= 10.38s ratio= 1.15 saved=-14.7%
+EXP3 C_ollama_env   edit_at_75pct cold=  8.96s edited=  9.25s ratio= 1.03 saved= -3.2%
+EXP3 C_ollama_env   edit_at_95pct cold=  9.15s edited=  0.99s ratio= 0.11 saved= 89.2%
+
+### ollama part A
+RESULT A ollama run1 prefill_tok=428 prefill_s=0.06 prefill_tps=7511.5 decode_tok=128 decode_s=2.22 decode_tps=57.78
+RESULT A ollama run2 prefill_tok=428 prefill_s=0.06 prefill_tps=7336.1 decode_tok=128 decode_s=2.23 decode_tps=57.38
+RESULT A ollama run1 prefill_tok=428 prefill_s=0.89 prefill_tps=483.0 decode_tok=128 decode_s=2.23 decode_tps=57.28
+RESULT A ollama run2 prefill_tok=428 prefill_s=0.09 prefill_tps=4610.5 decode_tok=128 decode_s=2.41 decode_tps=53.13
+RESULT A ollama run3 prefill_tok=428 prefill_s=0.06 prefill_tps=6606.6 decode_tok=128 decode_s=2.24 decode_tps=57.14
+
+### ollama runner cmdline
+llama-server --model /home/shadeform/.ollama/models/blobs/sha256-6be6d66a3f546d8c19b130dc41dc24b2fc159f84ffbc76a0ee0676205083cf5a --port 42851 --host 127.0.0.1 --no-webui --offline -c 4096 -np 1 --log-verbosity 4 --no-log-prefix --no-log-timestamps --no-jinja --chat-template chatml --flash-attn auto -b 512 -ub 512 --context-shift --keep 4
+
+### ollama placement
+common_params_fit_impl: getting device memory data for initial parameters:
+common_params_fit_impl: projected to use 61486 MiB of device memory vs. 48073 MiB of free device memory
+common_params_fit_impl: cannot meet free memory target of 1024 MiB, need to reduce device memory by 14436 MiB
+common_params_fit_impl: context size set by user to 4096 -> no change
+common_params_fit_impl: getting device memory data with all MoE tensors moved to system memory:
+common_params_fit_impl: with only dense weights in device memory there is a total surplus of 43290 MiB
+common_params_fit_impl: id=0, target=47049 MiB
+common_params_fit_impl: memory for test allocation by device:
+common_params_fit_impl: id=0, n_layer= 0, n_part= 0, overflow_type=4, mem=   615 MiB
+common_params_fit_impl: filling dense-only layers back-to-front:
+common_params_fit_impl: memory for test allocation by device:
+common_params_fit_impl: id=0, n_layer=37, n_part=36, overflow_type=4, mem=  5375 MiB

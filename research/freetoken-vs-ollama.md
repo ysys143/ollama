@@ -6,6 +6,12 @@
 - 논문: arXiv 2608.16157 "FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution"
   (Berkeley Sky/BAIR 중심 + MIT 공저 — Yang, Fan, Pan, Xi, Wang, Sun, Keutzer, Han, Zaharia, Xu, Stoica)
 
+> **2026-08-24 실측 검증 완료 — §11 참조.**
+> 초판(§1–§10)은 코드 읽기와 논문 독해만으로 작성됐다. 이후 RTX 6000 Ada에서 실제로 측정한 결과
+> 일부 주장이 반증됐다. 특히 **§10-B의 `-ncmoe` 권고는 철회한다** — 플래그를 전달하면
+> 8~61% 느려지고 낮은 값에서는 모델이 로드되지 않는다. 반면 §6.3-③(semantic anchor)의 전제는
+> 검증됐고 논문 서술보다 문제가 크다. 반증된 문장에는 본문에도 표시를 달았다.
+
 ---
 
 ## 0. 한 줄 결론
@@ -32,8 +38,14 @@ FreeToken은 **"VRAM에 안 들어가는 MoE 모델을 NVIDIA GPU 한 장으로 
 
 ### Ollama
 - `llm/llama_server.go:403-410` — `-ngl` 만 전달, 기본은 llama-server의 `-ngl auto`.
-- **레이어 단위** 정적 배치. 로드 시점에 결정되고 런타임에 안 바뀐다.
+- ~~**레이어 단위** 정적 배치.~~ **[정정 — §11.2]** 실측 결과 핀된 b10488의
+  `common_params_fit_impl`은 **레이어 하위 단위(partial tensor) 오버플로**를 수행한다.
+  gpt-oss-120b 로드 시 "37 layers (11 overflowing)"로 VRAM을 99%(47.5/48GB)까지 채운다.
+  **정적**(로드 시점 결정, 런타임 불변)이라는 점은 맞지만 입도는 레이어보다 미세하다.
+  FreeToken과의 진짜 차이는 입도가 아니라 **동적 여부**다.
 - expert 단위 플래그를 **노출하지 않음**(전 트리 grep 결과 0건). §10-B 참조 — 업스트림에는 있다.
+  **[보강 — §11.1]** 업스트림 소스뿐 아니라 Ollama가 배포하는 바이너리에 컴파일되어 있다.
+  단, 전달했다면 오히려 느려진다(§11.2).
 - 즉 MoE 라우팅이 토큰마다 바뀐다는 사실을 시스템이 전혀 모른다.
 
 ### FreeToken
@@ -390,42 +402,62 @@ the user experience / create a large future maintenance burden"* 에 정면으�
 **즉 §2의 갭은 llama.cpp 문제가 아니라 순수하게 Ollama 배관 문제다.**
 Ollama가 핀한 바로 그 버전에 기능이 있는데 `llm/llama_server.go`가 전달하지 않는다.
 
-### 미검증 — 성능 수치는 아무도 재현하지 않았다
+### 측정 완료 (2026-08-24) — 결과는 §11
 
-이 리포트의 모든 배수·tok/s·miss rate는 **논문에서 읽은 값**이다. 이 세션에서 벤치마크를
-돌린 적이 없다. 다음이 남아 있다:
+초판 작성 시점에는 이 리포트의 모든 배수·tok/s·miss rate가 **논문에서 읽은 값**이었다.
+이후 RTX 6000 Ada에서 항목 1을 실측했다.
 
 1. 동일 GGUF·동일 머신에서 `ollama serve` vs `llama-server -ncmoe N` 직접 비교
+   → **측정 완료. `-ncmoe`는 단조롭게 느려진다(§11.2).** 이 항목이 §10-B의 전제를 무너뜨렸다.
 2. Ollama 단독 대비 FreeToken 배수 (논문에 명시 없음)
-3. `-ncmoe`를 노출했을 때 miss rate가 실제로 얼마나 개선되는지 (정적 배치의 질 개선일 뿐
-   동적 LRU는 아니므로 개선폭이 제한적일 것으로 예상되나 미측정)
+   → **여전히 미검증.** FreeToken은 `flashlib==0.3.0`이 저장소에 없어 실행하지 못했다.
+3. `-ncmoe`를 노출했을 때 개선폭
+   → **측정 완료. 개선이 아니라 악화다(§11.2).** "정적 배치의 질 개선"이라는 예상 자체가 틀렸다.
+      자동 배치가 이미 `-ncmoe`보다 미세한 입도로 더 잘 채우고 있었기 때문이다.
 
-**측정 없이 이 수치를 인용해 업스트림에 제안하지 말 것.**
+**논문의 배수 주장(2)은 여전히 미검증이므로 이 수치를 인용해 업스트림에 제안하지 말 것.**
 
 ---
 
 ## 10. 후속 조치 권고
 
-### A. 먼저 측정
+### A. 먼저 측정 — **완료 (§11)**
 
 같은 모델·같은 하드웨어에서 `ollama serve` vs `llama-server -ncmoe N`. 이게 있어야 그 다음이 선다.
+→ 2026-08-24 수행. 결과가 아래 B를 뒤집었다.
 
-### B. Ollama — Performance 이슈로, 프레이밍 주의
+### B. ~~Ollama — Performance 이슈로, 프레이밍 주의~~ **[철회 — §11.2]**
+
+> **철회 사유.** 아래 초판 권고에서 "권장"으로 표시한 문제 진술 자체가 사실이 아니다.
+> 실측에서 Ollama는 llama-server 직접 실행보다 **느리지 않았고**(56.5 vs 52.2 tok/s),
+> `-ncmoe`를 주면 오히려 8~61% 느려졌으며 낮은 값에서는 모델이 로드조차 되지 않았다(§11.2).
+>
+> 역설적으로 초판이 "비권장"으로 분류한 판단 — Ollama가 노브를 늘리지 않고 자동화에 맡기는
+> 철학 — 이 이 사안에서는 옳았다. `common_params_fit_impl`의 자동 맞춤이 수동 `-ncmoe`보다
+> 잘한다. **이 건으로 Ollama에 이슈를 내지 말 것.**
+>
+> 아래는 기록을 위해 남긴 초판 내용이다.
 
 `CONTRIBUTING.md`가 꼽는 ideal issues에 `Performance`가 있다. 단:
 
-- ❌ "`--n-cpu-moe` 플래그를 노출해주세요" — Ollama는 노브 추가를 싫어한다
+- [비권장] "`--n-cpu-moe` 플래그를 노출해주세요" — Ollama는 노브 추가를 싫어한다
   (*"new features add surface area"*). `-ngl auto` 자동화가 그들의 철학
-- ✅ **"MoE 모델이 VRAM을 초과할 때 Ollama가 llama-server 직접 실행보다 느리다"** — 문제 리포트로.
+- [권장] **"MoE 모델이 VRAM을 초과할 때 Ollama가 llama-server 직접 실행보다 느리다"** — 문제 리포트로.
   해법(`-ncmoe` 자동 계산, 메모리 추정기가 MoE 텐서 인지)은 제안으로만
 
 `CONTRIBUTING.md` proposal tips: *"Explain the problem you are trying to solve, not what you are
 trying to do."*
 
-### C. Ollama MLX 스냅샷 — 이슈보다 PR
+### C. Ollama MLX 스냅샷 — 이슈보다 PR **[근거 보강 — §11.3]**
 
 위치가 특정됐고(`x/mlxrunner/pipeline.go:139`) 변경이 작다. non-trivial 판단이 애매하니
 이슈를 먼저 열고 PR을 붙이는 게 안전하다. GDN을 쓰는 `qwen3_5_moe`부터 효과가 크다.
+
+§11.3에서 **CUDA 경로의 동일 문제를 실측**했다. 컨텍스트 중간을 편집하면 분기 지점이 마지막
+배치(512토큰) 밖일 경우 공통 접두사 길이와 무관하게 전체 재prefill이 발생한다. semantic anchor가
+겨냥하는 문제가 실재함을 뒷받침한다. 다만 **CUDA 경로의 수정은 Ollama가 아니라 llama.cpp
+작업**이므로 Ollama 측 PR은 여전히 MLX 경로에 한정된다.
+세 권고 중 유일하게 살아남았고, 이제 측정 근거까지 갖췄다.
 
 ### D. llama.cpp — 이슈 내지 말 것
 
@@ -440,3 +472,163 @@ trying to do."*
 
 FreeToken은 flashml.ai에서 데스크톱 앱을 배포하는 팀의 논문이다. 경쟁 프로젝트 이슈 트래커에
 "이 팀 기술을 도입하라"를 올리면 홍보로 읽힐 소지가 있다. **본인 측정으로 프레이밍해야 한다.**
+
+---
+
+# 11. 실측 검증 (2026-08-24)
+
+§10-A가 요구한 측정을 수행했다. 결과가 §2의 전제와 §10-B의 권고를 뒤집었다.
+
+## 11.0 환경과 통제
+
+- Brev `pgcuvs-freetoken-rtx6000ada` (massedcompute_RTX6000Ada)
+- GPU: NVIDIA RTX 6000 Ada 48,508 MiB / 드라이버 580.126.09 / PCIe 4.0 x16
+- CPU: Xeon Platinum 8352Y x2, 12 vCPU, NUMA 2노드 / RAM 70 GiB
+- Ollama 0.32.15, 번들 llama-server `0.1.2-dev (build 1, commit 9d77fa172)`
+- 모델: `gpt-oss:120b` (MXFP4 MoE, 61 GiB blob, 37 레이어) — 48GB VRAM 초과로 오프로딩 강제
+
+원래 계획은 논문 주력 셀인 RTX 5090이었으나, Brev 공개 카탈로그에는 있어도 조직 프로비저닝
+목록에 없어(`includeUnavailable`·`skipAccessFilter` 모두 적용해도 부재) 사용할 수 없었다.
+
+**통제:** 양쪽 모두 **동일한 GGUF blob**과 **동일한 바이너리**(Ollama 배포본)를 사용한다.
+직접 실행 시 Ollama가 실제로 넘기는 인자를 그대로 복제해 `--n-cpu-moe`만 유일한 차이가 되게 했다:
+
+```
+--no-webui --offline -c 4096 -np 1 --no-jinja --flash-attn auto -b 512 -ub 512 --context-shift --keep 4
+```
+
+이 인자 목록은 추측이 아니라 `ollama serve` 실행 중 `ps`로 확인한 실제 러너 명령줄이다.
+거기에 `-ngl`도 `-ncmoe`도 `-ot`도 없다는 것 자체가 §9 주장의 직접 증거다.
+
+## 11.1 정적 검증 — §9는 사실이고, 더 강하다
+
+| 확인 항목 | 결과 |
+|---|---|
+| `LLAMA_CPP_VERSION` | `b10488` |
+| 해당 태그 업스트림 `common/arg.cpp` | `-ot`(2715), `-cmoe`(2721), `-ncmoe`(2728) 실재 |
+| Ollama 트리 내 참조 | 0건 |
+| `llm/llama_server.go` 전달 인자 | `-ngl`만, 그것도 `NumGPU` 명시 시에만 |
+| **Ollama 배포 바이너리 `--help`** | **`-ot`, `-cmoe`, `-ncmoe` 모두 존재** |
+| 실제 러너 명령줄 | 셋 다 없음 |
+
+초판은 "업스트림 소스에 있다"까지 확인했다. 실측은 한 걸음 더 나아간다 —
+**그 기능은 사용자가 이미 설치한 바이너리에 컴파일되어 들어 있다.** 코드가 전달만 안 할 뿐이다.
+
+## 11.2 성능 — `-ncmoe`는 개선이 아니라 악화다
+
+| 구성 | decode tok/s | prefill tok/s | VRAM |
+|---|---|---|---|
+| Ollama 래퍼 (5회) | **56.5** | 483 | 46,923 MiB |
+| 직접 실행, 플래그 없음 | **52.2** | 303 | 47,474 MiB |
+| `--n-cpu-moe 4` | 로드 실패 | — | — |
+| `--n-cpu-moe 8` | 로드 실패 | — | — |
+| `--n-cpu-moe 12` | 47.8 (-8%) | 319 | 43,150 MiB |
+| `--n-cpu-moe 16` | 40.6 (-22%) | 265 | 36,680 MiB |
+| `--n-cpu-moe 24` | 28.2 (-46%) | 179 | 23,742 MiB |
+| `--n-cpu-moe 36` | 20.4 (-61%) | 103 | 4,334 MiB |
+
+(퍼센트는 자동 배치 52.2 tok/s 대비. 직접 실행 baseline이 Ollama를 재현하므로 통제는 유효하다.)
+
+**단조 감소이며 자동 배치를 이기는 지점이 없다.** 낮은 값은
+`llama_model_load: error loading model: unable to allocate CUDA0 buffer`로 죽는다.
+
+### 왜 그런가 — §2 정정의 근거
+
+```
+common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part, overflow_type)=(37, 11, UP)
+  - CUDA0: 37 layers (11 overflowing), 46923 MiB used, 1149 MiB free
+load_tensors: offloaded 37/37 layers to GPU
+load_tensors:   CPU_Mapped model buffer size = 18858.31 MiB
+load_tensors:        CUDA0 model buffer size = 46123.42 MiB
+```
+
+자동 맞춤은 37개 레이어를 전부 GPU로 보내되 11개를 **부분 오버플로**시켜 VRAM을 99%까지 채운다.
+반면 `--n-cpu-moe N`은 앞쪽 N개 레이어의 MoE 텐서를 **통째로** CPU에 고정하는 거친 입도라
+VRAM이 남는다(N=12에서 4GB 이상 유휴, N=36에서는 43GB 유휴). 남긴 만큼 CPU가 계산하니 느려진다.
+
+따라서 §2의 "레이어 단위 정적 배치"는 부정확하다. **정적인 것은 맞지만 입도는 이미 레이어보다
+미세하다.** FreeToken과의 진짜 차이는 입도가 아니라 **동적 여부**(토큰마다 재배치하는가)다.
+초판이 갭의 위치를 한 칸 잘못 짚었다.
+
+여기서 CPU 잔류분은 PCIe로 스트리밍되는 게 아니라 **CPU가 직접 계산**한다
+(ggml은 텐서가 있는 백엔드에 연산을 할당). §7의 구도에서 llama.cpp는 "항상 CPU 계산" 쪽에
+가깝고, 비율을 대역폭이 아니라 메모리 맞춤으로만 정한다는 점이 실측으로 확인된다.
+
+## 11.3 컨텍스트 편집 시 재prefill — §6.3-③의 전제는 참, 논문보다 심각
+
+조건마다 **한 번도 본 적 없는 고유 salt를 붙인 5,080토큰 본문**을 써 실험 간 캐시 누수를 차단.
+조건별로 콜드 prefill `C`를 재고, 같은 본문의 한 섹션만 교체해 재요청한 prefill `E`를 잰다.
+
+| 편집 깊이 | `E/C` (2회) | 절약 | 이상적 절약 |
+|---|---|---|---|
+| 5% | 0.99 / 0.99 | 1% | ~5% |
+| 25% | 1.03 / 1.02 | -2% | ~25% |
+| 50% | 1.02 / 1.02 | -2% | ~50% |
+| 75% | 1.10 / 1.01 | -1% | ~75% |
+| 95% | 0.10 / 0.10 | **90%** | ~95% |
+| 99% | 0.06 / 0.06 | **94%** | ~99% |
+
+**계단 함수.** 5,080토큰 기준 95% 지점 편집은 뒤에 약 265토큰, 75% 지점은 약 1,280토큰이 남는다.
+경계가 배치 크기(`-b 512`)와 일치한다 → **분기 지점이 마지막 배치 안에 있을 때만 재사용된다.**
+
+논문은 *"any checkpoint taken after the modified position becomes invalid"* — 수정 지점
+**이전**은 남는다고 본다. 실측은 그보다 나쁘다. **마지막 배치 밖이면 이전 것까지 전부 버린다.**
+§6.3-③이 인용한 하네스 동작(OpenClaw의 thinking 제거, OpenCode의 tool output placeholder 치환,
+SWE-agent의 observation 절삭)은 모두 컨텍스트 깊숙한 곳을 고치므로 매번 전체 재prefill을 유발한다.
+
+Ollama 경유와 llama-server 직접 실행이 동일한 곡선을 보였다
+→ **Ollama 래퍼 특성이 아니라 llama.cpp 자체 동작이다.**
+
+### 기각된 가설 — `--cache-reuse`
+
+`--cache-reuse N`("min chunk size to attempt reusing from the cache via KV shifting",
+env `LLAMA_ARG_CACHE_REUSE`)이 번들 바이너리에 있고 Ollama 참조는 0건이라, 위 문제를 겨냥하는
+"두 번째 미전달 플래그"로 보였다. 측정 결과 **효과 없음**:
+
+| 편집 깊이 | 무플래그 | `--cache-reuse 256` | `LLAMA_ARG_CACHE_REUSE=256 ollama serve` |
+|---|---|---|---|
+| 25% | -0.6% | -1.8% | -15.7% |
+| 50% | -4.2% | -3.6% | -14.7% |
+| 75% | -0.5% | -2.7% | -3.2% |
+| 95% | 89.2% | 89.4% | 89.2% |
+
+추정 원인: KV 시프팅은 RoPE 위치 재매핑을 전제하는데 gpt-oss-120b는 full/sliding attention을
+교대로 써 시프팅이 성립하지 않는다. (미확인 — 다른 아키텍처로 재측정 필요)
+
+### 부수 발견 — 환경변수 우회 경로가 이미 존재한다
+
+러너 프로세스의 `/proc/<pid>/environ`에서 `LLAMA_ARG_CACHE_REUSE=256`을 확인했다.
+`SetupLlamaServerCommandEnv`가 `cmd.Env = os.Environ()`로 시작하기 때문이다.
+
+**즉 사용자는 Ollama 코드 수정 없이 `LLAMA_ARG_*` 환경변수로 llama-server 옵션을 켤 수 있다.**
+§8.2의 "Ollama가 가진 통제 수단은 CLI 플래그뿐"이라는 서술에 한 줄 추가가 필요하다 —
+사용자 측 통제 수단으로는 환경변수도 있다. (이번 플래그는 효과가 없었지만 메커니즘은 작동한다.)
+
+## 11.4 측정 함정 기록
+
+- **`GGML_BACKEND_PATH` 누락 시 CPU 전용으로 조용히 실행된다.** 첫 스윕에서 baseline이
+  7.5 tok/s(Ollama의 1/8)로 나와 성능 차이처럼 보였으나, 실제로는 GPU 미사용이었다.
+  `--list-devices`가 `(none)`을 반환하고 `VRAM 2 MiB`가 단서였다. Ollama의 llama-server는
+  GGML 동적 백엔드 로딩을 쓰는데 CUDA 백엔드가 `cuda_v13/` 하위에 있어 자동 발견되지 않는다.
+  `llm/llama_server.go`의 `llamaServerLibraryPaths`가 이 `.so`를 찾아 주입하는 것이
+  래퍼의 실질적 역할 중 하나다. → **벤치마크에는 "장치가 실제로 쓰였는가"를 확인할 독립 지표가 필수.**
+- **`sudo -E`로는 이 실험을 할 수 없다.** sudo는 보안상 `LD_LIBRARY_PATH`를 `-E`로도 삭제한다.
+- **Ollama `/api/generate`의 `prompt_eval_count`는 캐시 적중과 무관하게 항상 전체 프롬프트
+  토큰 수를 보고한다.** "재계산된 토큰 수" 지표로 쓸 수 없다. 유효한 신호는
+  `prompt_eval_duration`뿐이며, prefill 수치도 2회차부터 캐시가 걸려(428토큰 0.06초 =
+  7,500 tok/s) 콜드 값만 유효하다. decode는 영향받지 않는다.
+- **캐시 실험은 조건마다 고유 입력을 써야 한다.** 서버를 재사용하며 같은 본문을 돌린 1·2차 시도는
+  직전 조건의 캐시가 다음 조건의 출발점을 바꿔 비단조 결과(5%=9.5s인데 25%=1.0s)를 냈고,
+  "콜드 기준"으로 삼은 값 자체가 이미 캐시 적중이라 "콜드 대비 300%" 같은 무의미한 비율이 나왔다.
+
+## 11.5 이 검증이 덮지 못하는 범위
+
+- 모델/VRAM 비율 **1.36**(61GiB / 45GiB)에서만 측정. 논문이 다루는 극단적 비율
+  (753B on 96GB)에서는 호스트 잔류분이 지배적이라 결론이 다를 수 있다.
+  이 머신의 RAM 70GB로는 그 영역에 도달할 수 없다.
+- `gpt-oss-120b`는 활성 파라미터가 5.1B로 작아 CPU 계산분이 상대적으로 저렴하다.
+- 단일 스트림 단발 요청. 논문이 강조하는 다중 턴 에이전트 워크로드는 미측정.
+- RTX 5090(논문 주력 셀) 미사용. RTX 6000 Ada는 논문 Table 1에 없는 하드웨어다.
+- `-cmoe`, `-ot` 커스텀 정규식, speculative decoding 미측정.
+- **FreeToken 자체를 실행하지 않았다.** `flashlib==0.3.0`이 저장소에 없다.
+  따라서 §5의 배수 주장은 여전히 미검증이며, 이 검증은 "Ollama 측 갭"만 다룬다.
