@@ -470,10 +470,14 @@ trying to do."*
 
 1. 내려던 것(`-ncmoe` 계열)은 **이미 있다** (§9). "이미 있음"으로 닫힌다
 2. 남은 건 `ggml_backend_sched` 수술이라 이슈 한 장으로 될 규모가 아니고,
-   `CONTRIBUTING.md:34` *"Features must begin with an issue... let interest accumulate"* 라 해도
    구현 의지 없는 논문 소개는 stale로 죽는다
-3. **`CONTRIBUTING.md:25` — AI로 이슈/PR 본문을 작성하는 것이 명시적으로 금지돼 있다.**
-   낸다면 반드시 본인이 직접 작성해야 한다
+3. ~~**`CONTRIBUTING.md:25` — AI로 이슈/PR 본문을 작성하는 것이 명시적으로 금지돼 있다.**~~
+   **[정정 — 사실 오류]** 이 저장소의 `CONTRIBUTING.md`(전체 88줄)에는 AI 작성 금지 조항이
+   없다. 25행은 유지보수 부담에 관한 내용, 34행 인용문("Features must begin with an
+   issue... let interest accumulate")은 파일에 존재하지 않는 문구다. `.github/` 디렉터리
+   자체가 없고 `git log`에도 그런 조항이 있었던 적이 없다. 초판이 인용을 지어냈다.
+   다만 AI가 작성한 티가 나는 이슈/PR은 일반적으로 신뢰도가 낮게 읽히므로, 조항 유무와
+   무관하게 본인 검토·수정을 거쳐 올리는 편이 낫다.
 
 ### E. 이해상충 주의
 
