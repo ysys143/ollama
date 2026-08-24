@@ -715,3 +715,130 @@ Claude Code 프로세스 4개가 떠 있어 스왑이 13/14GB로 거의 가득 �
   8192/16384 격자와 편집 위치의 관계가 달라지면 절약폭도 달라진다.
 - **FreeToken 자체를 실행하지 않았다.** `flashlib==0.3.0`이 저장소에 없다.
   따라서 §5의 배수 주장은 여전히 미검증이며, 이 검증은 "Ollama 측 갭"만 다룬다.
+
+---
+
+# 12. 업스트림 이슈 후보 검토 (2026-08-24)
+
+§10의 네 권고 중 §10-B는 §11.2 실측으로 철회됐고, §10-D는 §11에서 인용 오류까지 발견돼
+정정됐다(아래 참조). 남은 후보를 다시 심사하고, 이번에 새로 떠오른 후보도 검토했다.
+
+## 12.1 §10-D 인용 오류 정정
+
+초판 §10-D 3번 항목은 *"`CONTRIBUTING.md:25` — AI로 이슈/PR 본문을 작성하는 것이 명시적으로
+금지돼 있다"*, 그리고 §10-D 2번 항목은 `CONTRIBUTING.md:34`의 *"Features must begin with an
+issue... let interest accumulate"*를 인용했다. **둘 다 존재하지 않는 인용이다.**
+`CONTRIBUTING.md`는 전체 88줄이고, 25행은 유지보수 부담에 관한 내용(AI와 무관), 34행 근처에는
+해당 문구 자체가 없다. `git log`로 히스토리를 확인해도 그런 조항이 있었던 적이 없고,
+`.github/` 디렉터리 자체가 존재하지 않는다. 초판이 인용을 지어냈다. 본문 §10-D는 취소선과
+정정 표시로 갱신했다. 실제로 검증되는 두 인용(§10-B의 "Issues that may not be accepted:
+changes that add significant friction"과 "Explain the problem you are trying to solve, not
+what you are trying to do")은 파일과 대조해 정확함을 확인했다.
+
+## 12.2 유일하게 살아남은 후보: MLX 프리필 스냅샷 배치 정책
+
+§10-C(MLX semantic anchor)는 §11.3(CUDA 아날로그 실측)과 §11.5(MLX 직접 실측) 두 번의
+독립적 측정으로 뒷받침된, 네 후보 중 유일하게 제출 가능한 수준의 이슈다.
+
+**위치**: `x/mlxrunner/pipeline.go:139`
+
+**문제**: 8192토큰 고정 격자 + `len(inputs)-4`에만 스냅샷을 놓는다. 프롬프트 내용을 전혀
+읽지 않는다. 실측(§11.5, 19,149토큰 프롬프트): 편집이 가장 가까운 격자점 이전이면 절약
+0%에 가깝고, 격자점을 지나야만 30~78%가 절약된다. 에이전트 하네스가 컨텍스트 깊숙한 곳
+(오래된 tool output, thinking 블록)을 편집하는 경우가 흔한데, 편집 위치가 8192의 배수와
+우연히 맞아떨어질 이유가 없다.
+
+**근거**: `preThinking = 4`는 이름과 달리 토큰을 읽지 않는 위치 상수다(§11.5). 특수 토큰
+(`</think>`, tool-call 종료 등) 인식은 스냅샷 경로 어디에도 없다 — 파서(`model/parsers/*`)는
+디코딩된 문자열을 다뤄 러너 하류에 있어 `pipeline.prefill`에서 닿지 않는다.
+
+**분류**: `CONTRIBUTING.md`의 ideal issue 카테고리(Bugs/Performance/Security) 중
+Performance에 해당한다. 새 플래그·API를 추가하는 게 아니라 기존 정책을 바꾸는 문제라
+"신규 기능은 표면적을 늘린다"는 통상적 거부감도 덜 받는다.
+
+### 제출용 이슈 초안 (영문 — GitHub 이슈는 영어로 작성하는 것이 이 저장소의 실질적 관례다)
+
+```
+Title: MLX runner's prefill snapshot placement is purely positional, causing
+       full re-prefill when agent context edits fall between grid points
+
+**Problem**
+
+x/mlxrunner/pipeline.go:139 schedules KV/recurrent-state snapshots at a
+fixed 8192-token interval plus one near the prompt end, with no awareness
+of prompt content. When an agent edits context mid-conversation (removing
+stale tool output, trimming an old thinking block — common in harnesses
+that manage context length), the nearest usable snapshot is often well
+before the edit point, or none exists at all if the edit falls in the
+first 8192 tokens.
+
+Measured on qwen3.5:4b-mlx (one of the two architectures using
+RecurrentCache) with a 19k-token prompt: editing before the first grid
+point saves ~0% (full re-prefill); editing between grid points saves
+roughly (grid_offset / total_tokens) — i.e. the gap between the snapshot
+and the edit is wasted every time, regardless of how much unchanged
+content follows.
+
+**Why this matters**
+
+Agentic workloads are exactly the case where mid-context edits are
+routine, and the MLX runner already carries the snapshot infrastructure
+needed to do better (cache.Snapshot/PrepareSnapshots/Restore, and
+RecurrentCache's conv/delta-state snapshotting) — this is a placement
+policy question, not a missing-capability one.
+
+**How it would be used**
+
+Any MLX-path model with a long or edited context — coding agents,
+multi-turn tool use — would see reduced prefill latency after an edit,
+proportional to how close the snapshot lands to the actual edit boundary
+instead of the nearest 8192-token multiple.
+
+**How it would be tested**
+
+Compare prefill duration after a mid-context edit, with the current fixed
+grid vs. a content/position-aware placement, at several edit depths.
+```
+
+**프레이밍 주의** (§10-E 연장): 이 조사는 FreeToken(경쟁 프로젝트) 비교에서 출발했다.
+이슈 본문에 FreeToken이나 그 논문을 언급하지 말 것. 문제 자체가 Ollama 코드 안에서
+자립적으로 성립하므로 그럴 필요도 없다.
+
+## 12.3 기각된 후보
+
+### `LLAMA_ARG_*` 환경변수 통과 (§11.3 부수 발견) — 기각
+
+§11.3에서 `LLAMA_ARG_CACHE_REUSE`가 `os.Environ()`을 통해 러너까지 전달됨을 확인하고,
+한때 "Ollama의 정적 메모리 예측(`PredictServerVRAM`)이 런타임에 사용자가 임의로 바꾼 배치와
+어긋날 수 있다"는 잠재적 버그로 의심했다.
+
+재확인 결과 기각. `LLAMA_ARG_FIT`·`LLAMA_ARG_FIT_TARGET`은 Ollama가 **이미 공식 지원·문서화한**
+환경변수다(`envconfig/config.go:320-321`에 설명이 있고, `cmd/cmd.go:2524-2525`에서
+`ollama serve --help` 출력에 다른 `OLLAMA_*` 변수들과 나란히 나열된다). `cmd.Env =
+os.Environ()`로 전체를 통과시키는 것은 사고가 아니라 이미 의도된 설계의 일부이며, 나머지
+`LLAMA_ARG_*`가 따라 흘러가는 건 일반적인 서브프로세스 상속 동작일 뿐이다. 이슈로 내면
+"이미 그렇게 쓰고 있다"는 답을 받는다.
+
+### 극단적 모델/VRAM 비율에서 `-ncmoe` 유용성 — 보류 (근거 부족)
+
+§11.2는 비율 1.36(61GiB/45GiB)에서만 측정했다(§11.6 한계). 논문이 다루는 753B on 96GB급
+극단 비율에서는 결론이 달라질 수 있지만 측정한 적이 없다. 지금 이슈로 내면 §10-B에서
+스스로 철회한 권고와 모순된다. 측정 없이는 제출하지 않는다.
+
+### `server/sched.go`의 OOM 시 재로드 방식 — 보류 (근거 부족)
+
+Ollama는 OOM 시 컨텍스트를 줄여 모델을 다시 로드한다(`reduceAutoNumCtxForLoadOOM`).
+FreeToken의 런타임 캐시 재조정(§3-③)과 대비되는 아키텍처 차이지만, 측정한 적 없는
+관찰이다. 이 규모의 변경 요청은 `CONTRIBUTING.md`의 "large future maintenance burden"
+거부 사유에 걸릴 소지도 크다.
+
+## 12.4 요약
+
+| 후보 | 판정 | 근거 |
+|---|---|---|
+| MLX 프리필 스냅샷 정책 | **제출 가능** | §11.3 + §11.5, 두 번 실측 |
+| `-ncmoe` 노출 | 철회 (§11.2) | 실측 결과 역효과 |
+| llama.cpp에 `-ncmoe` 요청 | 불필요 | 이미 있음 |
+| `LLAMA_ARG_*` 환경변수 | 기각 | 이미 공식 지원되는 설계 |
+| 극단 비율에서 `-ncmoe` | 보류 | 미측정, §10-B와 모순 |
+| OOM 시 재로드 방식 | 보류 | 미측정, 대규모 변경 |
