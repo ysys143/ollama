@@ -463,7 +463,10 @@ trying to do."*
 §11.5에서 **MLX 경로 자체를 직접 측정**했다. 8192토큰 격자 스냅샷이 이미 30~78%의 재prefill을
 절약하고 있어 — CUDA 경로의 거의 0%보다 훨씬 낫다 — 인프라가 공짜라는 판단뿐 아니라
 **지금도 실제로 이득을 내고 있다는 것**까지 확인됐다. 남은 건 격자를 편집 경계에 맞춰
-이미 나는 이득을 늘리는 문제이지, 없는 걸 만드는 문제가 아니다.
+이미 나는 이득을 늘리는 문제이지, 없는 걸 만드는 문제가 아니다. 단 이 이득은
+`RecurrentCache`를 쓰는 하이브리드 모델(`qwen3_5`/`qwen3_5_moe`, `nemotron_h`)에 한정된다
+— 순수 `KVCache` 모델은 스냅샷 없이도 임의 위치로 되감을 수 있어 애초에 이 문제가 없을
+가능성이 높다(§11.5 메커니즘 분석, 코드 추론이며 미실측).
 세 권고 중 유일하게 살아남았고, 이제 측정 근거까지 갖췄다.
 
 ### D. llama.cpp — 이슈 내지 말 것
@@ -637,7 +640,9 @@ env `LLAMA_ARG_CACHE_REUSE`)이 번들 바이너리에 있고 Ollama 참조는 0
 §8.2 T0("기계는 이미 있고 정책만 바꾸면 된다")를 로컬 M3 Max(RAM 39GB, macOS 26.5)에서
 검증했다. `qwen3.5:4b-mlx`(safetensors, `IsMLX()` 참 → MLX 러너 진입 — `MLX engine
 initialized`, 923개 텐서 로드 로그로 확인)로 측정. `qwen3_5`는 `RecurrentCache`를 실제로
-쓰는 두 아키텍처(`qwen3_5`/`qwen3_5_moe`, `nemotron_h`) 중 하나다.
+쓰는 두 아키텍처(`qwen3_5`/`qwen3_5_moe`, `nemotron_h`) 중 하나이자 **하이브리드** 모델이다
+— 선형 어텐션 레이어는 `RecurrentCache`, 나머지는 일반 `KVCache`를 쓴다. 이 하이브리드 구성이
+아래 §11.5의 결과 해석에서 핵심이다.
 
 ### 코드 주장 재검증
 
@@ -660,6 +665,40 @@ initialized`, 923개 텐서 로드 로그로 확인)로 측정. `qwen3_5`는 `Re
 디코딩된 **문자열**을 다뤄 `pipeline.prefill`에서 닿지 않는다. `preThinking = 4`가
 유일한 "의미" 제스처지만 토큰을 전혀 읽지 않는 순수 위치 상수다.
 
+### 계단의 진짜 메커니즘 — 왜 하이브리드 모델에서만인가
+
+측정 이후 `switchToPath`(`prefix_cache.go`)와 `KVCache.Restore`(`kvcache.go:218`)를 더
+읽어보니, 계단의 원인을 "MLX 스냅샷 경로 일반"이 아니라 **하이브리드 모델의 RecurrentCache**로
+좁혀야 한다는 근거가 나왔다.
+
+`switchToPath`는 두 단계로 복원한다. 1단계는 스냅샷 없이 공짜로 되감기를 시도한다:
+
+```go
+rewindTarget := min(ancestorOffset, matched)   // ≈ 편집이 갈라지는 그 지점
+for _, kv := range c.caches {
+    if !kv.Restore(nil, rewindTarget) { kv.Free() }
+}
+```
+
+`KVCache.Restore`의 nil-스냅샷 분기는 `target ≤ 현재 offset`이면 그냥 `c.offset = target`으로
+끝난다 — **스냅샷 없이 임의 위치로 되감기가 가능하다.** 순수 `KVCache`만 쓰는 모델이라면 이
+1단계만으로 편집 지점(`matched`)까지 사실상 공짜로 복원되고, 재계산은 편집 이후분만 필요하다
+— 계단이 아니라 **편집 깊이에 비례하는 절약**이 나와야 한다.
+
+그런데 `RecurrentCache`는 누적 상태라 이 nil-분기가 `target`이 현재 보유한 상태의 offset과
+정확히 같을 때만 성립한다(recurrent.go:213). 임의 위치로는 되감을 수 없으므로 1단계
+`Restore(nil, rewindTarget)`가 실패해 `kv.Free()`로 완전히 버려진다. 2단계는 실제 스냅샷
+객체로 **앞으로만** 복원을 시도하는데(`node.hasSnapshots()`인 노드만 방문), 방금 버려진
+RecurrentCache는 8192 격자 스냅샷이 있어야만 뭔가를 되찾는다. 마지막으로 모든 캐시를
+`minCacheOffset()`로 정렬하는 단계가, KVCache가 이미 편집 지점까지 잘 되감아둔 것까지
+**RecurrentCache의 격자 제약으로 끌어내린다.**
+
+**결론**: 계단은 MLX 스냅샷 인프라 일반의 성질이 아니라, **하이브리드 모델에서 순환 레이어
+하나가 전체 복원을 8192 격자로 인질 잡는 현상**이다. 순수 `KVCache` 모델(비-recurrent —
+gemma4·glimmer·llama·qwen3(비-3.5) 등 §11 앞선 조사에서 RecurrentCache를 안 쓴다고 확인된
+아키텍처)은 애초에 이 문제가 없을 가능성이 높다. **이것은 코드 추론이며 실측하지 않았다** —
+아래 실측은 전부 하이브리드 모델(`qwen3.5:4b-mlx`) 하나에 대한 것이다.
+
 ### 실측: 8192토큰 격자가 만드는 계단
 
 §6.3-③·§11.3과 같은 설계(고유 salt, 콜드/편집 후 prefill 비교, 2회 반복). 19,149토큰
@@ -668,13 +707,23 @@ initialized`, 923개 텐서 로드 로그로 확인)로 측정. `qwen3_5`는 `Re
 | 편집 깊이 | 토큰 위치 | 절약 (rep1 / rep2) |
 |---|---|---|
 | 12% | 2,297 | −7% / −81%[^noise] |
-| 37% | 7,085 | 1% / 22% |
+| 37% | 7,085 | 1% / 22%[^noise2] |
 | 62% | 11,872 | **34% / 31%** |
 | 87% | 16,659 | **78% / 77%** |
 
-[^noise]: rep2 12%는 콜드 기준 자체가 22초→62초로 튄 이상값. 이 세션에서 동시에
+[^noise]: rep2 12%는 콜드 기준 자체가 22초→62초로 튄 이상값이다. 이 세션에서 동시에
 Claude Code 프로세스 4개가 떠 있어 스왑이 13/14GB로 거의 가득 찬 상태였고, 그 부하가
-측정 노이즈로 들어간 것으로 보인다. 재현 실험 시 시스템 부하를 낮추고 재측정 권장.
+측정 노이즈로 들어간 것으로 보인다.
+[^noise2]: rep2의 콜드 시간은 12%(62.02s)→37%(55.74s)→62%(34.20s)→87%(36.26s)로 실행
+초반에 rep1보다 2~2.7배 느리다가 점차 rep1 수준(24~32s)에 수렴한다 — 12%만의 국소
+이상치가 아니라 **실행 전체에 걸친 부하 드리프트**(스왑 압박이 초반에 심하다가 완화)다.
+37%의 22%는 이 드리프트가 남긴 노이즈로 보이며, 12%의 -81%처럼 국소 스파이크는 아니라서
+완전히 배제하진 않았다. 재현 실험 시 시스템 부하를 낮추고 재측정 권장.
+
+이 드리프트는 절대 시간(`cold_s`, `edited_s`)에는 크게 영향을 주지만, 정작 62%·87%의
+`saved%` 비율은 rep1(33.6%/77.8%)과 rep2(30.9%/77.1%)가 서로 다른 절대 시간대에서 측정됐음에도
+잘 수렴한다 — 콜드와 편집 후 요청이 같은 조건 안에서 곧바로 짝지어 측정되므로, 비율 지표가
+드리프트에 상당히 강건함을 시사한다.
 
 19,149토큰 프롬프트에는 `pipeline.go:139`의 8192 격자에 따라 8192와 16384 두 지점에
 스냅샷이 있다. 각 편집 위치가 **자기 앞의 가장 가까운 격자점**에서 복원된다는 가정으로 이론값을
@@ -682,16 +731,21 @@ Claude Code 프로세스 4개가 떠 있어 스왑이 13/14GB로 거의 가득 �
 
 - 62% 지점(11,872) → 8192에서 복원 → 이론상 1 − 10957/19149 = **42.8%** 절약. 실측 31~34%.
 - 87% 지점(16,659) → 16384에서 복원 → 이론상 1 − 2765/19149 = **85.6%** 절약. 실측 77~78%.
-- 12%·37% 지점은 8192 이전이라 앞에 쓸 스냅샷이 없음 → 이론상 ~0%. 실측 대체로 일치
-  (rep2 37%의 22%는 노이즈로 보임).
+- 12%·37% 지점은 8192 이전이라 앞에 쓸 스냅샷이 없음 → 이론상 ~0%.
 
-방향과 크기가 이론값에 근접해 계단 구조가 확인된다.
+두 지점 모두 실측이 이론보다 **10~13퍼센트포인트 낮게, 같은 방향으로** 벌어진다. 우연으로
+보기 어려운 일관된 갭이라, 트리 순회·캐시 정렬·상태 materialize 등 **복원 자체의 고정
+오버헤드**로 설명하는 편이 "근접한다"는 인상보다 정직하다. 방향과 계단 구조는 확인되지만
+정확한 %는 이 고정 비용을 빼고 봐야 한다.
 
 ### 두 경로의 정성적 차이
 
-**MLX 경로는 CUDA/llama.cpp 경로보다 실질적으로 낫다.** §11.3에서 llama.cpp는 편집이
-마지막 512토큰 배치 밖이면 거의 예외 없이 0% 절약이었다. MLX는 8192토큰 격자만 넘으면
-30~78%를 절약한다. `x/mlxrunner`의 스냅샷 인프라가 실제로 작동하고 있다.
+**MLX 경로(하이브리드 모델 한정)는 CUDA/llama.cpp 경로보다 실질적으로 낫다.** §11.3에서
+llama.cpp는 편집이 마지막 512토큰 배치 밖이면 거의 예외 없이 0% 절약이었다. `qwen3.5:4b-mlx`는
+8192토큰 격자만 넘으면 30~78%를 절약한다. `x/mlxrunner`의 스냅샷 인프라가 실제로 작동하고
+있다. 이 비교는 **같은 주장을 두 번 측정한 게 아니다** — §11.3은 "컨텍스트 깊은 곳 편집이
+비싸다는 문제가 Ollama의 추론 스택 전반에 실재한다"는 일반론의 증거이고, §11.5가 MLX의
+`pipeline.go:139` 메커니즘 자체에 대한 유일한 직접 증거다.
 
 동시에 T0가 제안하는 개선 여지도 이번 수치로 정량화된다. 62% 지점 편집은 이론상
 8192~62%(약 19퍼센트포인트)를 **격자가 편집 경계와 어긋나서** 낭비한다. 편집이 그 사이
@@ -699,6 +753,9 @@ Claude Code 프로세스 4개가 떠 있어 스왑이 13/14GB로 거의 가득 �
 편집이 실제 일어나는 경계(예: 도구 호출 결과 삭제 지점)에 맞추면 이 낭비 구간을
 좁힐 수 있다. **§10-C의 "거의 공짜로 흡수 가능"은 이 측정으로 뒷받침된다** — 인프라가
 이미 있고 실제로 이득을 내고 있으며, 정책 교체는 이미 나오고 있는 이득을 늘리는 문제다.
+단, 이 이득은 `RecurrentCache`를 쓰는 하이브리드 아키텍처에 한정된 이야기다 — 순수 `KVCache`
+모델은 애초에 자유 되감기로 이미 세밀한 재사용을 얻고 있을 가능성이 있어(위 메커니즘 참조),
+그쪽은 semantic anchor로 얻을 게 적거나 없을 수 있다.
 
 ## 11.6 이 검증이 덮지 못하는 범위
 
@@ -737,16 +794,27 @@ what you are trying to do")은 파일과 대조해 정확함을 확인했다.
 
 ## 12.2 유일하게 살아남은 후보: MLX 프리필 스냅샷 배치 정책
 
-§10-C(MLX semantic anchor)는 §11.3(CUDA 아날로그 실측)과 §11.5(MLX 직접 실측) 두 번의
-독립적 측정으로 뒷받침된, 네 후보 중 유일하게 제출 가능한 수준의 이슈다.
+§10-C(MLX semantic anchor)는 두 개의 서로 다른 증거로 뒷받침된다. §11.3(CUDA 경로 실측)은
+"컨텍스트 깊은 곳 편집이 비싸다는 문제가 Ollama의 추론 스택 전반에 실재한다"는 일반론의
+증거이고, §11.5(MLX 직접 실측 + 메커니즘 분석)가 `pipeline.go:139` 자체에 대한 유일한
+직접 증거다. 이 둘을 "같은 주장의 이중 검증"으로 묶으면 근거의 무게를 부풀리게 되므로
+구분해서 쓴다. 네 후보 중 유일하게 제출 가능한 수준인 것은 §11.5 쪽 근거 때문이다.
 
 **위치**: `x/mlxrunner/pipeline.go:139`
 
 **문제**: 8192토큰 고정 격자 + `len(inputs)-4`에만 스냅샷을 놓는다. 프롬프트 내용을 전혀
-읽지 않는다. 실측(§11.5, 19,149토큰 프롬프트): 편집이 가장 가까운 격자점 이전이면 절약
-0%에 가깝고, 격자점을 지나야만 30~78%가 절약된다. 에이전트 하네스가 컨텍스트 깊숙한 곳
-(오래된 tool output, thinking 블록)을 편집하는 경우가 흔한데, 편집 위치가 8192의 배수와
-우연히 맞아떨어질 이유가 없다.
+읽지 않는다. 실측(§11.5, `qwen3.5:4b-mlx`·19,149토큰 프롬프트): 편집이 가장 가까운 격자점
+이전이면 절약 0%에 가깝고, 격자점을 지나야만 30~78%가 절약된다. 에이전트 하네스가 컨텍스트
+깊숙한 곳(오래된 tool output, thinking 블록)을 편집하는 경우가 흔한데, 편집 위치가 8192의
+배수와 우연히 맞아떨어질 이유가 없다.
+
+**적용 범위 — 하이브리드(RecurrentCache) 아키텍처로 한정**: §11.5에서 `switchToPath`와
+`KVCache.Restore`를 대조해보니, 이 문제는 "MLX 스냅샷 경로 일반"이 아니라 **순환 상태를 쓰는
+하이브리드 모델**(`qwen3_5`/`qwen3_5_moe`, `nemotron_h`)에 한정된다. 순수 `KVCache` 모델은
+스냅샷 없이도 `Restore(nil, target)`로 임의 위치까지 공짜로 되감을 수 있어(`kvcache.go:218`),
+애초에 이 문제가 없을 가능성이 높다. **이 범위 판단은 코드 추론이며, 순수 KVCache MLX 모델로
+직접 재현·반증하지는 않았다.** 이슈에는 이 범위를 명시하고, "any MLX-path model"처럼
+일반화하지 않는다.
 
 **근거**: `preThinking = 4`는 이름과 달리 토큰을 읽지 않는 위치 상수다(§11.5). 특수 토큰
 (`</think>`, tool-call 종료 등) 인식은 스냅샷 경로 어디에도 없다 — 파서(`model/parsers/*`)는
@@ -760,7 +828,8 @@ Performance에 해당한다. 새 플래그·API를 추가하는 게 아니라 �
 
 ```
 Title: MLX runner's prefill snapshot placement is purely positional, causing
-       full re-prefill when agent context edits fall between grid points
+       full re-prefill on hybrid (RecurrentCache) models when agent context
+       edits fall between grid points
 
 **Problem**
 
@@ -772,12 +841,21 @@ that manage context length), the nearest usable snapshot is often well
 before the edit point, or none exists at all if the edit falls in the
 first 8192 tokens.
 
-Measured on qwen3.5:4b-mlx (one of the two architectures using
-RecurrentCache) with a 19k-token prompt: editing before the first grid
-point saves ~0% (full re-prefill); editing between grid points saves
-roughly (grid_offset / total_tokens) — i.e. the gap between the snapshot
-and the edit is wasted every time, regardless of how much unchanged
-content follows.
+This specifically affects models with recurrent-state layers (qwen3_5,
+qwen3_5_moe, nemotron_h). RecurrentCache.Restore requires an exact offset
+match (recurrent state is cumulative and can't be rewound to an arbitrary
+position), so switchToPath's free rewind-to-match-point (KVCache.Restore
+with a nil snapshot) fails for these layers and the whole cache falls back
+to the nearest scheduled grid point. Pure-KVCache models may not have this
+problem, since KVCache.Restore(nil, target) can rewind to any prior offset
+without needing a snapshot at all — this hasn't been verified separately.
+
+Measured on qwen3.5:4b-mlx with a 19k-token prompt: editing before the
+first grid point saves ~0% (full re-prefill); editing between grid points
+saves roughly (grid_offset / total_tokens), with a further ~10-13
+percentage point loss to fixed restore overhead — i.e. the gap between the
+snapshot and the edit is wasted every time, regardless of how much
+unchanged content follows.
 
 **Why this matters**
 
@@ -785,19 +863,21 @@ Agentic workloads are exactly the case where mid-context edits are
 routine, and the MLX runner already carries the snapshot infrastructure
 needed to do better (cache.Snapshot/PrepareSnapshots/Restore, and
 RecurrentCache's conv/delta-state snapshotting) — this is a placement
-policy question, not a missing-capability one.
+policy question for hybrid models, not a missing-capability one.
 
 **How it would be used**
 
-Any MLX-path model with a long or edited context — coding agents,
-multi-turn tool use — would see reduced prefill latency after an edit,
-proportional to how close the snapshot lands to the actual edit boundary
-instead of the nearest 8192-token multiple.
+Hybrid (RecurrentCache) models with a long or edited context — coding
+agents, multi-turn tool use — would see reduced prefill latency after an
+edit, proportional to how close the snapshot lands to the actual edit
+boundary instead of the nearest 8192-token multiple.
 
 **How it would be tested**
 
 Compare prefill duration after a mid-context edit, with the current fixed
-grid vs. a content/position-aware placement, at several edit depths.
+grid vs. a content/position-aware placement, at several edit depths, on
+both a hybrid model (to measure the fix) and a pure-KVCache model (to
+confirm it doesn't regress there).
 ```
 
 **프레이밍 주의** (§10-E 연장): 이 조사는 FreeToken(경쟁 프로젝트) 비교에서 출발했다.
@@ -836,7 +916,7 @@ FreeToken의 런타임 캐시 재조정(§3-③)과 대비되는 아키텍처 �
 
 | 후보 | 판정 | 근거 |
 |---|---|---|
-| MLX 프리필 스냅샷 정책 | **제출 가능** | §11.3 + §11.5, 두 번 실측 |
+| MLX 프리필 스냅샷 정책 (하이브리드 모델 한정) | **제출 가능** | §11.5 직접 실측 + 메커니즘 분석; §11.3은 일반 문제의 배경 증거 |
 | `-ncmoe` 노출 | 철회 (§11.2) | 실측 결과 역효과 |
 | llama.cpp에 `-ncmoe` 요청 | 불필요 | 이미 있음 |
 | `LLAMA_ARG_*` 환경변수 | 기각 | 이미 공식 지원되는 설계 |
